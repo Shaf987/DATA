@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta, time as dtime
+import re
 
 st.set_page_config(page_title="KLGA METAR vs LAMP", layout="wide")
 
@@ -67,7 +68,6 @@ def prepare_metar_day_table(metar_df: pd.DataFrame, date_et) -> pd.DataFrame:
 # ----- helpers for LAMP labels & sorting -----
 def _label_from_file_path_est(file_path: str) -> str:
     """file_path 'glmp...tHHMMz...' -> 'GLMP HH:MM EST' (UTC->EST)."""
-    import re
     m = re.search(r"t(\d{2})(\d{2})z", str(file_path))
     if not m:
         return "GLMP"
@@ -77,7 +77,6 @@ def _label_from_file_path_est(file_path: str) -> str:
 
 def _est_minutes_from_file_path(file_path: str) -> int:
     """Return EST minutes since midnight from file_path's tHHMMz; -1 if not parseable."""
-    import re
     m = re.search(r"t(\d{2})(\d{2})z", str(file_path))
     if not m:
         return -1
@@ -148,15 +147,17 @@ def prepare_lamp_day_table_aligned(lamp_df: pd.DataFrame, date_et, metar_cols):
 # ---- Top-3 hottest hours from the earliest GLMP run (all red) ----
 def top3_hot_hours_from_earliest(lamp_df: pd.DataFrame, date_et, metar_cols):
     """
-    Returns (red_cols, orange_cols) where:
+    Returns (red_cols, orange_cols, full_day) where:
       - red_cols: the 3 hottest hours (METAR column labels) from the *earliest* GLMP run
-      - orange_cols: empty (we're not using orange anymore)
+      - orange_cols: empty (not used)
+      - full_day: True only if the earliest GLMP run has coverage for ALL mapped hours (no NaN)
+    If the earliest run does not cover the entire day, returns no highlights and full_day=False.
     """
     l = _safe_to_datetime(lamp_df.copy(), "valid_time_est")
     daymask = l["valid_time_est"].dt.date.isin([date_et, date_et + timedelta(days=1)])
     day = l[daymask].copy()
     if day.empty:
-        return [], []
+        return [], [], False
 
     lamp_minute = int(day["valid_time_est"].dt.minute.mode().iloc[0])
     pivot = day.pivot_table(index="file_path", columns="valid_time_est", values="temp_F", aggfunc="first")
@@ -175,21 +176,23 @@ def top3_hot_hours_from_earliest(lamp_df: pd.DataFrame, date_et, metar_cols):
     order_asc = pd.Series({idx: _est_minutes_from_file_path(idx) for idx in pivot.index}) \
                   .sort_values(ascending=True).index
     if len(order_asc) == 0:
-        return [], []
+        return [], [], False
     earliest_idx = order_asc[0]
 
-    s = pivot.loc[earliest_idx, source_dts].dropna()
-    if s.empty:
-        return [], []
+    # Require *full-day* coverage (no NaN in any mapped hour)
+    s_all = pivot.loc[earliest_idx, source_dts]
+    full_day = s_all.notna().all()
+    if not full_day:
+        return [], [], False
 
-    # Map datetimes back to METAR columns and pick top 3
+    # With full coverage, pick top-3 hottest hours (no NaN present)
     dt_to_col = dict(zip(source_dts, metar_cols))
-    top3 = s.nlargest(min(3, len(s)))
-    cols_in_order = [dt_to_col[dt] for dt in top3.index if dt in dt_to_col]
+    top3 = s_all.nlargest(min(3, len(s_all)))
+    cols_in_order = [dt_to_col[dt] for dt in top3.index]
 
-    red_cols = cols_in_order[:3]  # all three in red
-    orange_cols = []              # none in orange
-    return red_cols, orange_cols
+    red_cols = cols_in_order[:3]   # all three in red
+    orange_cols = []               # none in orange
+    return red_cols, orange_cols, True
 
 # ---- Styling helpers (color full columns) ----
 def style_columns(df: pd.DataFrame, red_cols, orange_cols):
@@ -245,12 +248,14 @@ else:
     metar_cols = list(metar_table.columns) if not metar_table.empty else [f"{h:02d}:00" for h in range(24)]
     lamp_display, lamp_numeric, source_dts = prepare_lamp_day_table_aligned(lamp_df, selected_date, metar_cols)
 
-    # compute top-3 hottest hours from earliest GLMP run (all red)
-    red_cols, orange_cols = top3_hot_hours_from_earliest(lamp_df, selected_date, metar_cols)
+    # compute top-3 hottest hours from earliest GLMP run
+    red_cols, orange_cols, full_day = top3_hot_hours_from_earliest(lamp_df, selected_date, metar_cols)
 
     # render METAR with column highlights (values already formatted to 2 decimals)
     if not metar_table.empty:
         st.write(style_columns(metar_table, red_cols, orange_cols), unsafe_allow_html=True)
+        if not full_day:
+            st.caption("Earliest GLMP run does not cover the full day — red highlights disabled for today.")
     else:
         st.dataframe(metar_table, use_container_width=True)
 
