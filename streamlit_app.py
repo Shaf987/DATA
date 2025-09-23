@@ -186,38 +186,53 @@ def style_columns(df: pd.DataFrame, red_cols):
         return [''] * len(col)
     return df.style.apply(_col_style, axis=0)
 
-# ---- Bias computation ----
-def compute_biases_by_lead_from_aligned(lamp_numeric: pd.DataFrame,
-                                        source_dts: list,
-                                        metar_df: pd.DataFrame,
-                                        date_et,
-                                        metar_cols: list) -> dict:
-    if lamp_numeric is None or lamp_numeric.empty:
+# ---- ALL-TIME bias computation ----
+def compute_global_biases(lamp_df: pd.DataFrame, metar_df: pd.DataFrame) -> dict:
+    """
+    Compute mean (forecast - observed) by lead time bucket (0.5h bins) using ALL rows in both CSVs.
+    Matching rule: LAMP valid_time_est (naive ET) must match a METAR observation at the exact same ET minute.
+    """
+    # Basic column checks
+    need_lamp = {"valid_time_est", "observation_time_utc", "temp_F"}
+    need_metar = {"observation_time_et", "temp_F"}
+    if lamp_df.empty or not need_lamp.issubset(lamp_df.columns):
         return {}
-    m = _safe_to_datetime(metar_df.copy(), "observation_time_et")
-    metar_day = m[m["observation_time_et"].dt.date == date_et].copy()
-    if metar_day.empty:
+    if metar_df.empty or not need_metar.issubset(metar_df.columns):
         return {}
-    metar_map = dict(zip(metar_day["observation_time_et"].dt.strftime("%H:%M"), metar_day["temp_F"]))
-    col_to_dt = dict(zip(metar_cols, source_dts))
 
+    # Standardize datetimes
+    l = _ensure_dt_and_make_run_est(lamp_df)
+    l = l.dropna(subset=["valid_time_est", "run_est", "temp_F"]).copy()
+
+    m = _safe_to_datetime(metar_df.copy(), "observation_time_et")
+    m = m.dropna(subset=["observation_time_et", "temp_F"]).copy()
+
+    # Build a METAR map keyed by exact ET timestamp string
+    m["key"] = m["observation_time_et"].dt.strftime("%Y-%m-%d %H:%M")
+    metar_map = dict(zip(m["key"], m["temp_F"]))
+
+    # Iterate over all forecasts
     bucket_errors = {}
-    for run_est, row in lamp_numeric.iterrows():
-        for col in metar_cols:
-            fcst = row[col]
-            if pd.isna(fcst):
-                continue
-            obs = metar_map.get(col, None)
-            if obs is None or pd.isna(obs):
-                continue
-            src_dt = col_to_dt[col]
-            lead_hours = (src_dt - run_est).total_seconds() / 3600.0
-            lead_half_hours = round(lead_hours * 2) / 2.0
-            bucket_errors.setdefault(lead_half_hours, []).append(fcst - obs)
+    for idx, row in l.iterrows():
+        v_est = row["valid_time_est"]
+        r_est = row["run_est"]
+        fcst = row["temp_F"]
+        if pd.isna(v_est) or pd.isna(r_est) or pd.isna(fcst):
+            continue
+
+        key = v_est.strftime("%Y-%m-%d %H:%M")
+        obs = metar_map.get(key, None)
+        if obs is None or pd.isna(obs):
+            continue
+
+        lead_hours = (v_est - r_est).total_seconds() / 3600.0
+        lead_half_hours = round(lead_hours * 2) / 2.0
+        bucket_errors.setdefault(lead_half_hours, []).append(float(fcst) - float(obs))
 
     if not bucket_errors:
         return {}
 
+    # Average per bucket, format label like "-06:30" (keep the existing UI style)
     out = {}
     for lead in sorted(bucket_errors.keys()):
         vals = bucket_errors[lead]
@@ -230,11 +245,11 @@ def compute_biases_by_lead_from_aligned(lamp_numeric: pd.DataFrame,
         out[label] = mean_err
     return out
 
-def display_bias_cards(bias_dict: dict):
+def display_bias_cards(bias_dict: dict, title="Forecast Bias by Lead Time"):
     if not bias_dict:
-        st.info("No bias data available for the selected day.")
+        st.info("No bias data available.")
         return
-    st.subheader("Forecast Bias by Lead Time")
+    st.subheader(title)
     items = list(bias_dict.items())
     def chunks(lst, n):
         for i in range(0, len(lst), n):
@@ -321,16 +336,9 @@ else:
     else:
         st.dataframe(lamp_display, use_container_width=True)
 
-    # ---- Bias section ----
-    if lamp_numeric is not None and not lamp_numeric.empty and not metar_df.empty:
-        bias_dict = compute_biases_by_lead_from_aligned(
-            lamp_numeric=lamp_numeric,
-            source_dts=source_dts,
-            metar_df=metar_df,
-            date_et=selected_date,
-            metar_cols=metar_cols,
-        )
-        display_bias_cards(bias_dict)
+    # ---- ALL-TIME bias section ----
+    global_bias = compute_global_biases(lamp_df=lamp_df, metar_df=metar_df)
+    display_bias_cards(global_bias, title="Forecast Bias by Lead Time (All-Time)")
 
 # Optional raw previews
 with st.expander("Show raw LAMP & METAR data"):
