@@ -17,7 +17,7 @@ div.stCaption, p.stCaption { margin-top: .25rem !important; margin-bottom: .25re
 LAMP_URL = "http://34.9.231.83/glmp_temperature_klga.csv"
 METAR_URL = "http://34.9.231.83/klga_metar.csv"
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
 def load_csv(url: str) -> pd.DataFrame:
     return pd.read_csv(url)
 
@@ -186,13 +186,13 @@ def style_columns(df: pd.DataFrame, red_cols):
         return [''] * len(col)
     return df.style.apply(_col_style, axis=0)
 
-# ---- ALL-TIME bias computation ----
 def compute_global_biases(lamp_df: pd.DataFrame, metar_df: pd.DataFrame) -> dict:
     """
-    Compute mean (forecast - observed) by lead time bucket (0.5h bins) using ALL rows in both CSVs.
-    Matching rule: LAMP valid_time_est (naive ET) must match a METAR observation at the exact same ET minute.
+    Compute mean (forecast - observed) by 30-min lead time buckets using ALL rows.
+    Matching rule: for each LAMP valid_time_est (naive ET), pair with the nearest
+    METAR observation_time_et within ±20 minutes (tolerance adjustable).
     """
-    # Basic column checks
+    # Column checks
     need_lamp = {"valid_time_est", "observation_time_utc", "temp_F"}
     need_metar = {"observation_time_et", "temp_F"}
     if lamp_df.empty or not need_lamp.issubset(lamp_df.columns):
@@ -200,51 +200,67 @@ def compute_global_biases(lamp_df: pd.DataFrame, metar_df: pd.DataFrame) -> dict
     if metar_df.empty or not need_metar.issubset(metar_df.columns):
         return {}
 
-    # Standardize datetimes
-    l = _ensure_dt_and_make_run_est(lamp_df)
-    l = l.dropna(subset=["valid_time_est", "run_est", "temp_F"]).copy()
+    # Standardize datetimes / run times
+    l = _ensure_dt_and_make_run_est(lamp_df).copy()
+    l = l.dropna(subset=["valid_time_est", "run_est", "temp_F"])
+    l = l.rename(columns={"temp_F": "fcst_temp_F"})
 
+    # Keep only needed columns
+    l = l[["valid_time_est", "run_est", "fcst_temp_F"]].copy()
+
+    # Prepare METAR times
     m = _safe_to_datetime(metar_df.copy(), "observation_time_et")
-    m = m.dropna(subset=["observation_time_et", "temp_F"]).copy()
+    m = m.dropna(subset=["observation_time_et", "temp_F"])
+    m = m.rename(columns={"temp_F": "obs_temp_F"})
+    m = m[["observation_time_et", "obs_temp_F"]].copy()
 
-    # Build a METAR map keyed by exact ET timestamp string
-    m["key"] = m["observation_time_et"].dt.strftime("%Y-%m-%d %H:%M")
-    metar_map = dict(zip(m["key"], m["temp_F"]))
-
-    # Iterate over all forecasts
-    bucket_errors = {}
-    for idx, row in l.iterrows():
-        v_est = row["valid_time_est"]
-        r_est = row["run_est"]
-        fcst = row["temp_F"]
-        if pd.isna(v_est) or pd.isna(r_est) or pd.isna(fcst):
-            continue
-
-        key = v_est.strftime("%Y-%m-%d %H:%M")
-        obs = metar_map.get(key, None)
-        if obs is None or pd.isna(obs):
-            continue
-
-        lead_hours = (v_est - r_est).total_seconds() / 3600.0
-        lead_half_hours = round(lead_hours * 2) / 2.0
-        bucket_errors.setdefault(lead_half_hours, []).append(float(fcst) - float(obs))
-
-    if not bucket_errors:
+    if l.empty or m.empty:
         return {}
 
-    # Average per bucket, format label like "-06:30" (keep the existing UI style)
+    # Sort for merge_asof
+    l = l.sort_values("valid_time_est")
+    m = m.sort_values("observation_time_et")
+
+    # Nearest match within tolerance (±20 minutes)
+    tol = pd.Timedelta(minutes=20)
+    matched = pd.merge_asof(
+        l,
+        m,
+        left_on="valid_time_est",
+        right_on="observation_time_et",
+        direction="nearest",
+        tolerance=tol,
+    )
+
+    # Drop unmatched
+    matched = matched.dropna(subset=["obs_temp_F"])
+    if matched.empty:
+        return {}
+
+    # Compute lead time (hours) and bin into 30-min buckets
+    lead_hours = (matched["valid_time_est"] - matched["run_est"]).dt.total_seconds() / 3600.0
+    matched["lead_half_hours"] = (lead_hours * 2).round() / 2.0  # nearest 0.5h
+
+    # Error = forecast - observed
+    matched["err"] = matched["fcst_temp_F"].astype(float) - matched["obs_temp_F"].astype(float)
+
+    # Group by bucket and average
+    grp = matched.groupby("lead_half_hours")["err"].mean()
+
+    if grp.empty:
+        return {}
+
+    # Format labels like "-HH:MM" (keep your existing UI style)
     out = {}
-    for lead in sorted(bucket_errors.keys()):
-        vals = bucket_errors[lead]
-        if not vals:
-            continue
-        mean_err = float(sum(vals) / len(vals))
+    for lead, mean_err in grp.sort_index().items():
         total_minutes = int(round(abs(lead) * 60))
         hours, minutes = divmod(total_minutes, 60)
         label = f"-{hours:02d}:{minutes:02d}"
-        out[label] = mean_err
+        out[label] = float(mean_err)
+
     return out
 
+    
 def display_bias_cards(bias_dict: dict, title="Forecast Bias by Lead Time"):
     if not bias_dict:
         st.info("No bias data available.")
