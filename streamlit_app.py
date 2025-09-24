@@ -17,7 +17,7 @@ div.stCaption, p.stCaption { margin-top: .25rem !important; margin-bottom: .25re
 LAMP_URL = "http://34.9.231.83/glmp_temperature_klga.csv"
 METAR_URL = "http://34.9.231.83/klga_metar.csv"
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=10)
 def load_csv(url: str) -> pd.DataFrame:
     return pd.read_csv(url)
 
