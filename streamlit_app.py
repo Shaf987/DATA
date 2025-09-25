@@ -192,7 +192,6 @@ def compute_global_biases(lamp_df: pd.DataFrame, metar_df: pd.DataFrame) -> dict
     Matching rule: for each LAMP valid_time_est (naive ET), pair with the nearest
     METAR observation_time_et within ±20 minutes (tolerance adjustable).
     """
-    # Column checks
     need_lamp = {"valid_time_est", "observation_time_utc", "temp_F"}
     need_metar = {"observation_time_et", "temp_F"}
     if lamp_df.empty or not need_lamp.issubset(lamp_df.columns):
@@ -200,15 +199,11 @@ def compute_global_biases(lamp_df: pd.DataFrame, metar_df: pd.DataFrame) -> dict
     if metar_df.empty or not need_metar.issubset(metar_df.columns):
         return {}
 
-    # Standardize datetimes / run times
     l = _ensure_dt_and_make_run_est(lamp_df).copy()
     l = l.dropna(subset=["valid_time_est", "run_est", "temp_F"])
     l = l.rename(columns={"temp_F": "fcst_temp_F"})
-
-    # Keep only needed columns
     l = l[["valid_time_est", "run_est", "fcst_temp_F"]].copy()
 
-    # Prepare METAR times
     m = _safe_to_datetime(metar_df.copy(), "observation_time_et")
     m = m.dropna(subset=["observation_time_et", "temp_F"])
     m = m.rename(columns={"temp_F": "obs_temp_F"})
@@ -217,50 +212,38 @@ def compute_global_biases(lamp_df: pd.DataFrame, metar_df: pd.DataFrame) -> dict
     if l.empty or m.empty:
         return {}
 
-    # Sort for merge_asof
     l = l.sort_values("valid_time_est")
     m = m.sort_values("observation_time_et")
 
-    # Nearest match within tolerance (±20 minutes)
     tol = pd.Timedelta(minutes=20)
     matched = pd.merge_asof(
-        l,
-        m,
+        l, m,
         left_on="valid_time_est",
         right_on="observation_time_et",
         direction="nearest",
         tolerance=tol,
     )
 
-    # Drop unmatched
     matched = matched.dropna(subset=["obs_temp_F"])
     if matched.empty:
         return {}
 
-    # Compute lead time (hours) and bin into 30-min buckets
     lead_hours = (matched["valid_time_est"] - matched["run_est"]).dt.total_seconds() / 3600.0
     matched["lead_half_hours"] = (lead_hours * 2).round() / 2.0  # nearest 0.5h
-
-    # Error = forecast - observed
     matched["err"] = matched["fcst_temp_F"].astype(float) - matched["obs_temp_F"].astype(float)
 
-    # Group by bucket and average
     grp = matched.groupby("lead_half_hours")["err"].mean()
-
     if grp.empty:
         return {}
 
-    # Format labels like "-HH:MM" (keep your existing UI style)
     out = {}
     for lead, mean_err in grp.sort_index().items():
         total_minutes = int(round(abs(lead) * 60))
         hours, minutes = divmod(total_minutes, 60)
         label = f"-{hours:02d}:{minutes:02d}"
         out[label] = float(mean_err)
-
     return out
 
-    
 def display_bias_cards(bias_dict: dict, title="Forecast Bias by Lead Time"):
     if not bias_dict:
         st.info("No bias data available.")
@@ -293,6 +276,89 @@ def display_bias_cards(bias_dict: dict, title="Forecast Bias by Lead Time"):
               </div>
             </div>
             """, unsafe_allow_html=True)
+
+# ===== NEW: Bias-adjusted latest run helper =====
+def _lead_label_from_minutes(minutes: float) -> str:
+    """Convert +/- minutes to your '-HH:MM' bucket label using nearest 30-min increments."""
+    half_hours = round((minutes / 60.0) * 2) / 2.0
+    total_minutes = int(round(abs(half_hours) * 60))
+    hh, mm = divmod(total_minutes, 60)
+    return f"-{hh:02d}:{mm:02d}"
+
+def prepare_bias_adjusted_latest_run_table(
+    lamp_df: pd.DataFrame,
+    date_et,
+    metar_cols,
+    bias_dict: dict
+) -> pd.DataFrame:
+    """
+    Build a 3-row table for the *latest* GLMP run:
+      1) GLMP (bias-adjusted) °F
+      2) Bias applied (°F)
+      3) Datetime (LAMP valid)
+    Aligned to METAR/LAMP columns. Adjustment uses bucketed lead-time bias.
+    """
+    expected = {"valid_time_est", "observation_time_utc", "temp_F"}
+    if lamp_df.empty or not expected.issubset(lamp_df.columns):
+        return pd.DataFrame()
+
+    l = _ensure_dt_and_make_run_est(lamp_df).copy()
+    l = l.dropna(subset=["valid_time_est", "run_est"])
+
+    if l.empty:
+        return pd.DataFrame()
+
+    latest_run = l["run_est"].max()
+    run_rows = l[l["run_est"] == latest_run].copy()
+    if run_rows.empty:
+        return pd.DataFrame()
+
+    # Prefer the minute mode within this run
+    try:
+        lamp_minute = int(run_rows["valid_time_est"].dt.minute.mode().iloc[0])
+    except Exception:
+        lamp_minute = _pick_best_lamp_minute(l["valid_time_est"])
+
+    # Build the valid timestamps corresponding to each METAR column (like LAMP alignment)
+    source_dts = []
+    for col in metar_cols:
+        hh = int(col.split(":")[0])
+        lamp_hour = (hh + 1) % 24
+        base_date = date_et + (timedelta(days=1) if hh == 23 else timedelta(0))
+        source_dts.append(pd.Timestamp.combine(base_date, dtime(lamp_hour, lamp_minute)))
+
+    # Map valid_time_est -> temp for latest run
+    run_map = dict(zip(run_rows["valid_time_est"], run_rows["temp_F"]))
+
+    # Compute adjusted forecasts + biases
+    adj_vals = []
+    bias_vals = []
+    time_labels = []
+
+    for vdt in source_dts:
+        fcst = run_map.get(vdt, float("nan"))
+        # Lead time in minutes for latest run
+        lead_minutes = (vdt - latest_run).total_seconds() / 60.0
+        label = _lead_label_from_minutes(lead_minutes)
+        bias = float(bias_dict.get(label, 0.0))  # forecast - observed; subtract to correct
+        if pd.isna(fcst):
+            adj_vals.append("")
+            bias_vals.append("")
+        else:
+            adj_vals.append(f"{(float(fcst) - bias):.2f}")
+            bias_vals.append(f"{bias:+.2f}")
+        time_labels.append(vdt.strftime("%H:%M"))
+
+    df = pd.DataFrame(
+        [adj_vals, bias_vals, time_labels],
+        index=[
+            f"{_label_from_run_est(latest_run)} (bias-adjusted °F)",
+            "Bias applied (°F)",
+            "Datetime (LAMP valid)",
+        ],
+        columns=metar_cols,
+    )
+    return df
 
 # ---------- Load data ----------
 try:
@@ -330,30 +396,50 @@ else:
 
 st.markdown("<div style='height:.4rem'></div>", unsafe_allow_html=True)
 
+# ---- Compute all-time bias once (used below) ----
+global_bias = compute_global_biases(lamp_df=lamp_df, metar_df=metar_df)
+
 if lamp_df.empty:
     st.info("LAMP CSV not available.")
 else:
     metar_cols = list(metar_table.columns) if not metar_table.empty else [f"{h:02d}:00" for h in range(24)]
-    lamp_display, lamp_numeric, source_dts = prepare_lamp_day_table_aligned(lamp_df, selected_date, metar_cols)
-    red_cols, has_full = red_columns_from_full_day_run(lamp_df, selected_date, metar_cols)
 
+    # --- METAR table ---
     if not metar_table.empty:
-        st.write(style_columns(metar_table, red_cols), unsafe_allow_html=True)
-        if not has_full:
-            st.caption("No GLMP run with full-day coverage (01→23 + next-day 00) — highlights disabled.")
+        st.write(style_columns(metar_table, []), unsafe_allow_html=True)
     else:
         st.dataframe(metar_table, use_container_width=True)
 
-    st.markdown("<div style='height:.4rem'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:.6rem'></div>", unsafe_allow_html=True)
+
+    # ===== NEW: Bias-adjusted latest GLMP run (inserted BETWEEN METAR and LAMP) =====
+    bias_adj_df = prepare_bias_adjusted_latest_run_table(
+        lamp_df=lamp_df,
+        date_et=selected_date,
+        metar_cols=metar_cols,
+        bias_dict=global_bias
+    )
+    if not bias_adj_df.empty:
+        st.write(style_columns(bias_adj_df, []), unsafe_allow_html=True)
+        st.caption("Latest GLMP run adjusted by lead-time bias (bias = mean[forecast − observed] per bucket; we subtract it).")
+    else:
+        st.info("Bias-adjusted GLMP table unavailable for this date/run.")
+
+    st.markdown("<div style='height:.6rem'></div>", unsafe_allow_html=True)
+
+    # --- LAMP aligned table + highlights ---
+    lamp_display, lamp_numeric, source_dts = prepare_lamp_day_table_aligned(lamp_df, selected_date, metar_cols)
+    red_cols, has_full = red_columns_from_full_day_run(lamp_df, selected_date, metar_cols)
 
     if isinstance(lamp_display, pd.DataFrame) and not lamp_display.empty:
         st.write(style_columns(lamp_display, red_cols), unsafe_allow_html=True)
         st.caption("Top row shows the LAMP valid times used for each aligned METAR column.")
+        if not has_full:
+            st.caption("No GLMP run with full-day coverage (01→23 + next-day 00) — highlights disabled.")
     else:
         st.dataframe(lamp_display, use_container_width=True)
 
     # ---- ALL-TIME bias section ----
-    global_bias = compute_global_biases(lamp_df=lamp_df, metar_df=metar_df)
     display_bias_cards(global_bias, title="Forecast Bias by Lead Time (All-Time)")
 
 # Optional raw previews
